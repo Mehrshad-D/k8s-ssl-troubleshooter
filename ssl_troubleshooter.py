@@ -67,7 +67,7 @@ def switch_context(cluster, namespace):
     print("✔ Context ready")
 
 
-def apply_temp_access(namespace):
+def apply_temp_access(namespace, user):
     section("Applying TempAccess")
 
     manifest = textwrap.dedent(f"""
@@ -76,7 +76,7 @@ def apply_temp_access(namespace):
     metadata:
       name: check-podssssss
     spec:
-      username: hamravesh:mehrshad.dehghani
+      username: hamravesh:{user}
       ttl: 1h
       rules:
         - namespace: "{namespace}"
@@ -267,6 +267,8 @@ def main():
     parser.add_argument("--namespace", required=True)
     parser.add_argument("--domain", required=True)
     parser.add_argument("--pod", required=True)
+    parser.add_argument("--user", required=True)
+
 
     args = parser.parse_args()
 
@@ -277,7 +279,7 @@ def main():
     expected_host = VALID_CLUSTERS[args.cluster]
 
     switch_context(args.cluster, args.namespace)
-    apply_temp_access(args.namespace)
+    apply_temp_access(args.namespace, args.user)
     check_dns(args.domain, expected_host)
     ingress_check(args.domain)
     check_cert_manager(args.pod)
