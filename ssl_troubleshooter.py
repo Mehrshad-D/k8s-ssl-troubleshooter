@@ -165,74 +165,109 @@ def workload_name(pod):
 def check_cert_manager(pod):
     section("Cert Manager Resources")
 
-    base = workload_name(pod)
+    cert_name = f"{pod}-tls"
+    cert_request_prefix = f"{pod}-tls"
+    order_prefix = f"{pod}-tls"
 
-    resources = [
-        ("Certificates", "certificates.cert-manager.io"),
-        ("CertificateRequests", "certificaterequests.cert-manager.io"),
-        ("Orders", "orders.acme.cert-manager.io"),
-        ("Challenges", "challenges.acme.cert-manager.io")
+    # ---------------- Certificates ---------------- #
+    try:
+        certs = kubectl_json("certificates")
+    except:
+        print("No certificates found")
+        certs = {"items": []}
+
+    pod_cert = None
+    for c in certs.get("items", []):
+        if c["metadata"]["name"] == cert_name:
+            pod_cert = c
+            break
+
+    if pod_cert:
+        status = pod_cert.get("status", {})
+        conditions = status.get("conditions", [])
+        ready = any(c.get("type") == "Ready" and c.get("status") == "True" for c in conditions)
+        if ready:
+            print(f"✔ Certificate '{cert_name}' is Ready/Valid ✅")
+            return  # Everything is OK, stop here
+        else:
+            print(f"❌ Certificate '{cert_name}' is NOT ready")
+    else:
+        print(f"❌ Certificate '{cert_name}' not found")
+
+    # ---------------- CertificateRequests ---------------- #
+    try:
+        cert_reqs = kubectl_json("certificaterequests")
+    except:
+        cert_reqs = {"items": []}
+
+    matched_reqs = [
+        cr for cr in cert_reqs.get("items", [])
+        if cr["metadata"]["name"].startswith(cert_request_prefix)
     ]
 
-    cert_ready = False
-
-    # check certificates first
-    try:
-        certs_data = kubectl_json(resources[0][1])
-        for cert in certs_data.get("items", []):
-            if base in cert["metadata"]["name"]:
-                status = cert.get("status", {})
-                conds = status.get("conditions", [])
-                for c in conds:
-                    if c.get("type") == "Ready" and c.get("status") == "True":
-                        print(f"\n✔ Certificate '{cert['metadata']['name']}' is Ready/Valid ✅")
-                        cert_ready = True
-                        break
-    except:
-        pass
-
-    if cert_ready:
-        print("\n✅ Everything is OK. SSL certificate is valid.")
-        return
-
-    # if not valid, check CR, Order, Challenge
-    for title, res in resources[1:]:
-        print(f"\n--- {title} ---")
-        try:
-            data = kubectl_json(res)
-        except:
-            print("None found")
-            continue
-
-        matched = [
-            item for item in data.get("items", [])
-            if base in item["metadata"]["name"]
-        ]
-
-        if not matched:
-            print("None found")
-            continue
-
-        for item in matched:
-            name = item["metadata"]["name"]
+    if matched_reqs:
+        print("\n--- CertificateRequests ---")
+        for cr in matched_reqs:
+            name = cr["metadata"]["name"]
             print(f"\n{name}")
-            if title == "CertificateRequests":
-                status = item.get("status", {})
-                conds = status.get("conditions", [])
-                if conds:
-                    for c in conds:
-                        print(f"  • {c.get('type')} = {c.get('status')} ({c.get('reason','')})")
-                else:
-                    print("  No status conditions")
-            elif title == "Orders":
-                state = item.get("status", {}).get("state", "unknown")
-                print(f"  • State: {state}")
-                print(f"  • Age: {item['metadata'].get('creationTimestamp','')}")
-            elif title == "Challenges":
-                type_ = item.get("spec", {}).get("type", "")
-                status = item.get("status", {}).get("state", "")
-                reason = item.get("status", {}).get("reason", "")
-                print(f"  • Type: {type_}, Status: {status}, Reason: {reason}")
+            # Print some key info
+            status = cr.get("status", {})
+            conds = status.get("conditions", [])
+            if conds:
+                for c in conds:
+                    print(f"  • {c.get('type')} = {c.get('status')} ({c.get('reason','')})")
+            else:
+                print("  No status conditions")
+            # Describe full object
+            describe = run(f"kubectl describe certificaterequest {name}", proxy=True)
+            print(describe)
+    else:
+        print("\nNo CertificateRequests found for this pod")
+
+    # ---------------- Orders ---------------- #
+    try:
+        orders = kubectl_json("orders.acme.cert-manager.io")
+    except:
+        orders = {"items": []}
+
+    matched_orders = [
+        o for o in orders.get("items", [])
+        if o["metadata"]["name"].startswith(order_prefix)
+    ]
+
+    if matched_orders:
+        print("\n--- Orders ---")
+        for o in matched_orders:
+            name = o["metadata"]["name"]
+            state = o.get("status", {}).get("state", "Unknown")
+            print(f"\n{name} | State: {state}")
+            describe = run(f"kubectl describe order {name}", proxy=True)
+            print(describe)
+    else:
+        print("\nNo Orders found for this pod")
+
+    # ---------------- Challenges ---------------- #
+    try:
+        challenges = kubectl_json("challenges.acme.cert-manager.io")
+    except:
+        challenges = {"items": []}
+
+    matched_chals = [
+        ch for ch in challenges.get("items", [])
+        if ch["metadata"]["name"].startswith(order_prefix)
+    ]
+
+    if matched_chals:
+        print("\n--- Challenges ---")
+        for ch in matched_chals:
+            name = ch["metadata"]["name"]
+            state = ch.get("status", {}).get("state", "Unknown")
+            print(f"\n{name} | State: {state}")
+            describe = run(f"kubectl describe challenge {name}", proxy=True)
+            print(describe)
+    else:
+        print("\nNo Challenges found for this pod")
+
 
 
 def ingress_check(domain):
