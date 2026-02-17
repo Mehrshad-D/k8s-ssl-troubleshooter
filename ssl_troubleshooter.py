@@ -8,6 +8,7 @@ import os
 import re
 
 PROXY = "socks5h://127.0.0.1:1080"
+ARVAN_IPS = {"185.143.234.235", "185.143.233.235"}
 
 VALID_CLUSTERS = {
     "c11": "c11.hamravesh.onhamravesh.ir",
@@ -21,7 +22,6 @@ VALID_CLUSTERS = {
 def run(cmd, capture=True, proxy=False):
     env = None
     if proxy:
-        import os
         env = os.environ.copy()
         env["ALL_PROXY"] = PROXY
         env["HTTPS_PROXY"] = PROXY
@@ -86,9 +86,9 @@ def apply_temp_access(namespace):
     """)
 
     env = os.environ.copy()
-    env["ALL_PROXY"] = "socks5h://127.0.0.1:1080"
-    env["HTTPS_PROXY"] = "socks5h://127.0.0.1:1080"
-    env["HTTP_PROXY"] = "socks5h://127.0.0.1:1080"
+    env["ALL_PROXY"] = PROXY
+    env["HTTPS_PROXY"] = PROXY
+    env["HTTP_PROXY"] = PROXY
 
     result = subprocess.run(
         ["kubectl", "apply", "-f", "-"],
@@ -102,7 +102,7 @@ def apply_temp_access(namespace):
     if result.returncode != 0:
         print("❌ Failed applying TempAccess\n")
         print(result.stderr)
-        exit(1)
+        sys.exit(1)
 
     print(result.stdout.strip())
     print("✔ Temp access granted")
@@ -138,12 +138,11 @@ def check_dns(domain, expected_host):
         print("\n❌ No A records found for domain")
         return False
 
-    if domain_ips == expected_ips:
-        print("\n✔ DNS points to correct cluster")
-        return True
+    # include Arvan IPs
+    domain_ips = domain_ips | (domain_ips & ARVAN_IPS)
 
-    if domain_ips & expected_ips:
-        print("\n⚠ DNS partially matches cluster IPs")
+    if domain_ips == expected_ips or expected_ips & domain_ips or domain_ips & ARVAN_IPS:
+        print("\n✔ DNS points to correct cluster or Arvan CDN")
         return True
 
     print("\n❌ DNS DOES NOT point to cluster ingress")
@@ -155,19 +154,50 @@ def kubectl_json(resource):
     return json.loads(out)
 
 
+# normalize pod → workload base name
+def workload_name(pod):
+    parts = pod.split("-")
+    if len(parts) > 2:
+        return "-".join(parts[:-2])
+    return pod
+
+
 def check_cert_manager(pod):
     section("Cert Manager Resources")
 
+    base = workload_name(pod)
+
     resources = [
-        ("Certificates", "certificates"),
-        ("CertificateRequests", "certificaterequests"),
+        ("Certificates", "certificates.cert-manager.io"),
+        ("CertificateRequests", "certificaterequests.cert-manager.io"),
         ("Orders", "orders.acme.cert-manager.io"),
         ("Challenges", "challenges.acme.cert-manager.io")
     ]
 
-    for title, res in resources:
-        print(f"\n--- {title} ---")
+    cert_ready = False
 
+    # check certificates first
+    try:
+        certs_data = kubectl_json(resources[0][1])
+        for cert in certs_data.get("items", []):
+            if base in cert["metadata"]["name"]:
+                status = cert.get("status", {})
+                conds = status.get("conditions", [])
+                for c in conds:
+                    if c.get("type") == "Ready" and c.get("status") == "True":
+                        print(f"\n✔ Certificate '{cert['metadata']['name']}' is Ready/Valid ✅")
+                        cert_ready = True
+                        break
+    except:
+        pass
+
+    if cert_ready:
+        print("\n✅ Everything is OK. SSL certificate is valid.")
+        return
+
+    # if not valid, check CR, Order, Challenge
+    for title, res in resources[1:]:
+        print(f"\n--- {title} ---")
         try:
             data = kubectl_json(res)
         except:
@@ -176,7 +206,7 @@ def check_cert_manager(pod):
 
         matched = [
             item for item in data.get("items", [])
-            if pod in item["metadata"]["name"]
+            if base in item["metadata"]["name"]
         ]
 
         if not matched:
@@ -185,20 +215,24 @@ def check_cert_manager(pod):
 
         for item in matched:
             name = item["metadata"]["name"]
-            status = item.get("status", {})
-            conds = status.get("conditions", [])
-
             print(f"\n{name}")
-
-            if conds:
-                for c in conds:
-                    print(
-                        f"  • {c.get('type')} = {c.get('status')} "
-                        f"({c.get('reason','')})"
-                    )
-            else:
-                print("  No status conditions")
-
+            if title == "CertificateRequests":
+                status = item.get("status", {})
+                conds = status.get("conditions", [])
+                if conds:
+                    for c in conds:
+                        print(f"  • {c.get('type')} = {c.get('status')} ({c.get('reason','')})")
+                else:
+                    print("  No status conditions")
+            elif title == "Orders":
+                state = item.get("status", {}).get("state", "unknown")
+                print(f"  • State: {state}")
+                print(f"  • Age: {item['metadata'].get('creationTimestamp','')}")
+            elif title == "Challenges":
+                type_ = item.get("spec", {}).get("type", "")
+                status = item.get("status", {}).get("state", "")
+                reason = item.get("status", {}).get("reason", "")
+                print(f"  • Type: {type_}, Status: {status}, Reason: {reason}")
 
 
 def ingress_check(domain):
@@ -223,7 +257,6 @@ def ingress_check(domain):
 
     if not found:
         print("❌ Domain not referenced in any ingress")
-
 
 
 # ---------------- MAIN ---------------- #
