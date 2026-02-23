@@ -2,13 +2,12 @@
 import argparse
 import subprocess
 import sys
-import textwrap
 import json
 import os
 import re
+import textwrap
 
 PROXY = "socks5h://127.0.0.1:1080"
-ARVAN_IPS = {"185.143.234.235", "185.143.233.235"}
 
 VALID_CLUSTERS = {
     "c11": "c11.hamravesh.onhamravesh.ir",
@@ -16,56 +15,69 @@ VALID_CLUSTERS = {
     "c23": "c23.hamravesh.onhamravesh.ir"
 }
 
+IP_REGEX = re.compile(r"^\d+\.\d+\.\d+\.\d+$")
 
-# ---------------- UTIL ---------------- #
 
-def run(cmd, capture=True, proxy=False):
+# =========================================================
+# UTIL
+# =========================================================
+
+def section(t):
+    print("\n" + "="*60)
+    print(t)
+    print("="*60)
+
+
+def run(cmd, proxy=False, capture=True, input_text=None):
+
     env = None
     if proxy:
         env = os.environ.copy()
-        env["ALL_PROXY"] = PROXY
-        env["HTTPS_PROXY"] = PROXY
         env["HTTP_PROXY"] = PROXY
+        env["HTTPS_PROXY"] = PROXY
+        env["ALL_PROXY"] = PROXY
 
-    try:
-        result = subprocess.run(
-            cmd,
-            shell=True,
-            check=True,
-            text=True,
-            env=env,
-            stdout=subprocess.PIPE if capture else None,
-            stderr=subprocess.PIPE if capture else None
-        )
-        return result.stdout.strip() if capture else ""
-    except subprocess.CalledProcessError as e:
-        print(f"\n❌ Command failed:\n{cmd}\n")
-        if e.stdout:
-            print(e.stdout)
-        if e.stderr:
-            print(e.stderr)
+    result = subprocess.run(
+        cmd,
+        shell=True,
+        text=True,
+        input=input_text,
+        stdout=subprocess.PIPE if capture else None,
+        stderr=subprocess.PIPE if capture else None,
+        env=env
+    )
+
+    if result.returncode != 0:
+        print("\n❌ Command failed:\n", cmd)
+        if result.stdout:
+            print(result.stdout)
+        if result.stderr:
+            print(result.stderr)
         sys.exit(1)
 
-
-def section(title):
-    print("\n" + "=" * 60)
-    print(title)
-    print("=" * 60)
+    return result.stdout.strip() if capture else ""
 
 
-# ---------------- STEPS ---------------- #
+def kubectl_json(resource):
+    return json.loads(run(f"kubectl get {resource} -o json", proxy=True))
+
+
+# =========================================================
+# CONTEXT
+# =========================================================
 
 def switch_context(cluster, namespace):
     section("Switching Context")
 
-    print("→ Switching cluster...")
-    run(f"kubectx hamravesh-{cluster}", capture=False, proxy=True)
-
-    print("→ Switching namespace...")
-    run(f"kubens {namespace}", capture=False, proxy=True)
+    run(f"kubectx hamravesh-{cluster}", proxy=True, capture=False)
+    run(f"kubens {namespace}", proxy=True, capture=False)
 
     print("✔ Context ready")
 
+
+# =========================================================
+# TEMP ACCESS
+# =========================================================
 
 def apply_temp_access(namespace, user):
     section("Applying TempAccess")
@@ -74,7 +86,7 @@ def apply_temp_access(namespace, user):
     apiVersion: security.hamravesh.com/v1alpha1
     kind: TempAccess
     metadata:
-      name: check-podssssss
+      name: ssl-check
     spec:
       username: hamravesh:{user}
       ttl: 1h
@@ -85,241 +97,203 @@ def apply_temp_access(namespace, user):
           verbs: ["*"]
     """)
 
-    env = os.environ.copy()
-    env["ALL_PROXY"] = PROXY
-    env["HTTPS_PROXY"] = PROXY
-    env["HTTP_PROXY"] = PROXY
-
-    result = subprocess.run(
-        ["kubectl", "apply", "-f", "-"],
-        input=manifest,
-        text=True,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE
-    )
-
-    if result.returncode != 0:
-        print("❌ Failed applying TempAccess\n")
-        print(result.stderr)
-        sys.exit(1)
-
-    print(result.stdout.strip())
+    run("kubectl apply -f -", proxy=True, capture=False, input_text=manifest)
     print("✔ Temp access granted")
 
 
-
-IP_REGEX = re.compile(r"^\d+\.\d+\.\d+\.\d+$")
+# =========================================================
+# DNS
+# =========================================================
 
 def only_ips(lines):
     return {l.strip(".") for l in lines.splitlines() if IP_REGEX.match(l.strip("."))}
 
 
 def check_dns(domain, expected_host):
-    section("DNS Check")
+    print(f"\n→ Checking DNS for {domain}")
 
-    print(f"→ Resolving {domain}")
-    output = run(f"dig +short {domain}")
-
-    if not output:
-        print("❌ Domain does not resolve")
+    res = run(f"dig +short {domain}")
+    if not res:
+        print("   ❌ No DNS record")
         return False
 
-    print(f"Resolved records:\n{output}")
-
-    print("\n→ Resolving expected cluster host")
     expected = run(f"dig +short {expected_host}")
-    print(f"{expected_host} →\n{expected}")
 
-    domain_ips = only_ips(output)
-    expected_ips = only_ips(expected)
+    d_ips = only_ips(res)
+    e_ips = only_ips(expected)
 
-    if not domain_ips:
-        print("\n❌ No A records found for domain")
-        return False
-
-    # include Arvan IPs
-    domain_ips = domain_ips | (domain_ips & ARVAN_IPS)
-
-    if domain_ips == expected_ips or expected_ips & domain_ips or domain_ips & ARVAN_IPS:
-        print("\n✔ DNS points to correct cluster or Arvan CDN")
+    if d_ips & e_ips:
+        print("   ✔ DNS OK")
         return True
 
-    print("\n❌ DNS DOES NOT point to cluster ingress")
+    print("   ❌ DNS mismatch")
     return False
 
 
-def kubectl_json(resource):
-    out = run(f"kubectl get {resource} -o json", proxy=True)
-    return json.loads(out)
+# =========================================================
+# NAME HELPERS
+# =========================================================
 
-
-# normalize pod → workload base name
-def workload_name(pod):
+def workload_from_pod(pod):
     parts = pod.split("-")
-    if len(parts) > 2:
-        return "-".join(parts[:-2])
-    return pod
+    if len(parts) <= 2:
+        return pod
+    return "-".join(parts[:-2])
 
 
-def check_cert_manager(pod):
-    section("Cert Manager Resources")
+# =========================================================
+# INGRESS DISCOVERY
+# =========================================================
 
-    cert_name = f"{pod}-tls"
-    cert_request_prefix = f"{pod}-tls"
-    order_prefix = f"{pod}-tls"
+def find_domains(pod, app_type):
+    section("Finding Domains From Ingress")
 
-    # ---------------- Certificates ---------------- #
-    try:
-        certs = kubectl_json("certificates")
-    except:
-        print("No certificates found")
-        certs = {"items": []}
+    ing = kubectl_json("ingress")["items"]
 
-    pod_cert = None
-    for c in certs.get("items", []):
-        if c["metadata"]["name"] == cert_name:
-            pod_cert = c
-            break
+    domains = []
 
-    if pod_cert:
-        status = pod_cert.get("status", {})
-        conditions = status.get("conditions", [])
-        ready = any(c.get("type") == "Ready" and c.get("status") == "True" for c in conditions)
-        if ready:
-            print(f"✔ Certificate '{cert_name}' is Ready/Valid ✅")
-            return  # Everything is OK, stop here
-        else:
-            print(f"❌ Certificate '{cert_name}' is NOT ready")
-    else:
-        print(f"❌ Certificate '{cert_name}' not found")
+    if app_type == "marketplace":
 
-    # ---------------- CertificateRequests ---------------- #
-    try:
-        cert_reqs = kubectl_json("certificaterequests")
-    except:
-        cert_reqs = {"items": []}
+        for item in ing:
+            name = item["metadata"]["name"]
 
-    matched_reqs = [
-        cr for cr in cert_reqs.get("items", [])
-        if cr["metadata"]["name"].startswith(cert_request_prefix)
+            if pod in name:
+                rules = item.get("spec", {}).get("rules", [])
+                for r in rules:
+                    if "host" in r:
+                        domains.append(r["host"])
+
+    else:  # darkube
+
+        base = workload_from_pod(pod)
+
+        for item in ing:
+            name = item["metadata"]["name"]
+
+            if name == base:
+                rules = item.get("spec", {}).get("rules", [])
+                for r in rules:
+                    if "host" in r:
+                        domains.append(r["host"])
+
+    domains = sorted(set(domains))
+
+    if not domains:
+        print("❌ No ingress domains found")
+        sys.exit(1)
+
+    for d in domains:
+        print("✔", d)
+
+    return domains
+
+
+# =========================================================
+# CERT CHECK
+# =========================================================
+
+def cert_ready(cert):
+    conds = cert.get("status", {}).get("conditions", [])
+    return any(c["type"] == "Ready" and c["status"] == "True" for c in conds)
+
+
+def check_cert_manager(pod, app_type):
+    section("Cert Manager")
+
+    base = pod if app_type == "marketplace" else workload_from_pod(pod)
+    cert_name = f"{base}-tls"
+    prefix = f"{base}-tls"
+
+    certs = kubectl_json("certificates")["items"]
+    cert = next((c for c in certs if c["metadata"]["name"] == cert_name), None)
+
+    if cert and cert_ready(cert):
+        print(f"✔ Certificate {cert_name} READY")
+        print("\n✅ SSL is valid")
+        return True
+
+    print("❌ Certificate not ready")
+
+    # -------- Requests
+    reqs = [
+        r for r in kubectl_json("certificaterequests")["items"]
+        if r["metadata"]["name"].startswith(prefix)
     ]
 
-    if matched_reqs:
-        print("\n--- CertificateRequests ---")
-        for cr in matched_reqs:
-            name = cr["metadata"]["name"]
-            print(f"\n{name}")
-            # Print some key info
-            status = cr.get("status", {})
-            conds = status.get("conditions", [])
-            if conds:
-                for c in conds:
-                    print(f"  • {c.get('type')} = {c.get('status')} ({c.get('reason','')})")
-            else:
-                print("  No status conditions")
-            # Describe full object
-            describe = run(f"kubectl describe certificaterequest {name}", proxy=True)
-            print(describe)
-    else:
-        print("\nNo CertificateRequests found for this pod")
+    if reqs:
+        print("\nCertificateRequests:")
+        for r in reqs:
+            print(" •", r["metadata"]["name"])
 
-    # ---------------- Orders ---------------- #
-    try:
-        orders = kubectl_json("orders.acme.cert-manager.io")
-    except:
-        orders = {"items": []}
-
-    matched_orders = [
-        o for o in orders.get("items", [])
-        if o["metadata"]["name"].startswith(order_prefix)
+    # -------- Orders
+    orders = [
+        o for o in kubectl_json("orders.acme.cert-manager.io")["items"]
+        if o["metadata"]["name"].startswith(prefix)
     ]
 
-    if matched_orders:
-        print("\n--- Orders ---")
-        for o in matched_orders:
+    if orders:
+        print("\nOrders:")
+        for o in orders:
             name = o["metadata"]["name"]
-            state = o.get("status", {}).get("state", "Unknown")
-            print(f"\n{name} | State: {state}")
-            describe = run(f"kubectl describe order {name}", proxy=True)
-            print(describe)
-    else:
-        print("\nNo Orders found for this pod")
+            state = o.get("status", {}).get("state")
+            print(" •", name, "|", state)
 
-    # ---------------- Challenges ---------------- #
-    try:
-        challenges = kubectl_json("challenges.acme.cert-manager.io")
-    except:
-        challenges = {"items": []}
-
-    matched_chals = [
-        ch for ch in challenges.get("items", [])
-        if ch["metadata"]["name"].startswith(order_prefix)
+    # -------- Challenges
+    chals = [
+        c for c in kubectl_json("challenges.acme.cert-manager.io")["items"]
+        if c["metadata"]["name"].startswith(prefix)
     ]
 
-    if matched_chals:
-        print("\n--- Challenges ---")
-        for ch in matched_chals:
-            name = ch["metadata"]["name"]
-            state = ch.get("status", {}).get("state", "Unknown")
-            print(f"\n{name} | State: {state}")
-            describe = run(f"kubectl describe challenge {name}", proxy=True)
-            print(describe)
-    else:
-        print("\nNo Challenges found for this pod")
+    if chals:
+        print("\nChallenges:")
+        for c in chals:
+            name = c["metadata"]["name"]
+            state = c.get("status", {}).get("state")
+            dom = c.get("spec", {}).get("dnsName")
+            print(" •", name, "|", dom, "|", state)
+
+    return False
 
 
-
-def ingress_check(domain):
-    section("Ingress Check")
-
-    try:
-        ing = kubectl_json("ingress")
-    except:
-        print("No ingresses found")
-        return
-
-    found = False
-
-    for item in ing["items"]:
-        name = item["metadata"]["name"]
-        rules = item.get("spec", {}).get("rules", [])
-
-        for r in rules:
-            if r.get("host") == domain:
-                found = True
-                print(f"✔ Domain found in ingress: {name}")
-
-    if not found:
-        print("❌ Domain not referenced in any ingress")
-
-
-# ---------------- MAIN ---------------- #
+# =========================================================
+# MAIN
+# =========================================================
 
 def main():
+
     parser = argparse.ArgumentParser()
-    parser.add_argument("--cluster", required=True, help="c11 | c13 | c23")
+
+    parser.add_argument("--cluster", required=True)
     parser.add_argument("--namespace", required=True)
-    parser.add_argument("--domain", required=True)
     parser.add_argument("--pod", required=True)
     parser.add_argument("--user", required=True)
-
+    parser.add_argument("--app-type", required=True, choices=["marketplace","darkube"])
 
     args = parser.parse_args()
 
     if args.cluster not in VALID_CLUSTERS:
-        print("Invalid cluster. Must be: c11, c13, c23")
+        print("Invalid cluster")
         sys.exit(1)
 
     expected_host = VALID_CLUSTERS[args.cluster]
 
     switch_context(args.cluster, args.namespace)
     apply_temp_access(args.namespace, args.user)
-    check_dns(args.domain, expected_host)
-    ingress_check(args.domain)
-    check_cert_manager(args.pod)
 
-    section("Done")
+    domains = find_domains(args.pod, args.app_type)
+
+    section("DNS Checks")
+    for d in domains:
+        check_dns(d, expected_host)
+
+    ok = check_cert_manager(args.pod, args.app_type)
+
+    section("Result")
+
+    if ok:
+        print("✔ SSL healthy")
+    else:
+        print("❌ SSL has issues")
 
 
 if __name__ == "__main__":
